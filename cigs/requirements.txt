@@ -1,4 +1,0 @@
-duckduckgo_search==7.2.1
-pyarrow==19.0.0
-pytz==2024.2
-SQLAlchemy==2.0.37
