@@ -17,6 +17,7 @@ class UserSchema(BaseModel):
     is_active: Optional[bool] = True
     is_machine: Optional[bool] = False
     user_data: Optional[Dict[str, Any]] = None
+    wallet_address: Optional[str] = None
 
 
 class EmailPasswordAuthSchema(BaseModel):

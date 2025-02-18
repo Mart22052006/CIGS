@@ -12,13 +12,16 @@ from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
 from config import Config
 from cigs.api.schemas.user import UserSchema, UserRole, Token
-
+from web3 import Web3
+from eth_account.messages import encode_defunct
+from fastapi import HTTPException
 from pydantic import BaseModel
 
 AGENT_LIMIT = int(os.getenv("AGENT_LIMIT", 1))
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES"))
+w3 = Web3(Web3.HTTPProvider(os.getenv("BASE_RPC_URL")))
 
 
 def init_db():
@@ -34,7 +37,8 @@ def init_db():
             email_verified BOOLEAN DEFAULT FALSE,
             is_active BOOLEAN DEFAULT TRUE,
             is_machine BOOLEAN DEFAULT FALSE,
-            user_data TEXT
+            user_data TEXT,
+            wallet_address TEXT
         )
     """)
 
@@ -71,7 +75,10 @@ def get_db():
 
 init_db()
 
-
+class WalletAuthRequest(BaseModel):
+    wallet_address: str
+    signature: str
+    message: str
 class AgentRequest(BaseModel):
     agent_name: str
     main_purpose: str
@@ -133,6 +140,14 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> UserSchema:
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
+def is_wallet_on_base_chain(wallet_address: str) -> bool:
+    """Проверяет, существует ли кошелек в сети Base Chain (даже если баланс 0)"""
+    try:
+        balance = w3.eth.get_balance(wallet_address)  # Получаем баланс кошелька
+        return True  # Возвращаем True, даже если баланс 0
+    except Exception as e:
+        print(f"Ошибка проверки кошелька: {e}")
+        return False
 
 def check_by_role(roles: List[UserRole]):
     def decorator(func):
@@ -151,7 +166,7 @@ def check_by_role(roles: List[UserRole]):
     return decorator
 
 # Регистрация пользователя
-def register_user(email: str, username: str, name: str, password: str, role: str = UserRole.USER):
+def register_user(email: str, username: str, name: str, password: str, role: Optional[str] = None):
     conn, cursor = get_db()
 
     cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
@@ -162,6 +177,11 @@ def register_user(email: str, username: str, name: str, password: str, role: str
     if cursor.fetchone():
         raise ValueError("Username is already taken")
 
+    # Проверяем, если зарегистрированный пользователь - супер-админ, назначаем ему роль ADMIN
+    if username == os.getenv("SUPER_ADMIN_USERNAME") and password == os.getenv("SUPER_ADMIN_PASSWORD"):
+        role = UserRole.ADMIN
+    else:
+        role = role or UserRole.USER  # Если роль не передана, по умолчанию USER
     password_hash = get_hashed_password(password)
 
     cursor.execute("""
@@ -172,7 +192,39 @@ def register_user(email: str, username: str, name: str, password: str, role: str
     conn.commit()
     conn.close()
 
-    return {"message": f"User {role} registered successfully"}
+    return {"message": f"User {username} registered successfully"}
+
+def wallet_register(wallet_address: str, signature: str, message: str):
+    """Регистрация пользователя через кошелек MetaMask (Base Chain)"""
+    # Проверяем подпись
+    message_encoded = encode_defunct(text=message)
+    recovered_address = w3.eth.account.recover_message(message_encoded, signature=signature)
+
+    if recovered_address.lower() != wallet_address.lower():
+        raise HTTPException(status_code=400, detail="Signature verification failed")
+
+    # Проверяем, существует ли кошелек в сети Base
+    if not is_wallet_on_base_chain(wallet_address):
+        raise HTTPException(status_code=400, detail="Wallet is not on Base Chain")
+
+    conn, cursor = get_db()
+
+    cursor.execute("SELECT * FROM users WHERE wallet_address = ?", (wallet_address,))
+    existing_user = cursor.fetchone()
+
+    if existing_user:
+        return {"message": "User already exists", "wallet": wallet_address}
+
+    cursor.execute("""
+        INSERT INTO users (wallet_address) 
+        VALUES (?)
+    """, (wallet_address,))
+
+    conn.commit()
+    conn.close()
+
+    return {"message": "Registration successful", "wallet": wallet_address}
+
 
 # Аутентификация пользователя
 def authenticate_user(username: str, password: str):
@@ -192,6 +244,31 @@ def authenticate_user(username: str, password: str):
 
     return Token(access_token=access_token, token_type="bearer")
 
+def authenticate_wallet_user(wallet_address: str, signature: str, message: str):
+    """Авторизация пользователя через MetaMask"""
+    # Проверяем подпись
+    message_encoded = encode_defunct(text=message)
+    recovered_address = w3.eth.account.recover_message(message_encoded, signature=signature)
+
+    if recovered_address.lower() != wallet_address.lower():
+        raise HTTPException(status_code=400, detail="Signature verification failed")
+
+    conn, cursor = get_db()
+    cursor.execute("SELECT role FROM users WHERE wallet_address = ?", (wallet_address,))
+    user = cursor.fetchone()
+    conn.close()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Генерируем токен
+    access_token_expires = timedelta(minutes=int(Config.ACCESS_TOKEN_EXPIRE_MINUTES))
+    access_token = jwt.encode(
+        {"sub": wallet_address, "role": user[0], "exp": datetime.utcnow() + access_token_expires},
+        Config.SECRET_KEY, algorithm=Config.ALGORITHM
+    )
+
+    return {"message": "Login successful", "wallet": wallet_address, "token": access_token}
 # Получение информации о пользователе
 def get_user_info(user: dict):
     return user
